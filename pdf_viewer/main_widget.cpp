@@ -76,6 +76,8 @@
 #include "book.h"
 #include "utils.h"
 #include "ui.h"
+#include "tab_bar_widget.h"
+#include "color_wheel_widget.h"
 #include "pdf_renderer.h"
 #include "document.h"
 #include "document_view.h"
@@ -122,6 +124,8 @@ extern std::wstring PAPER_SEARCH_CONTRIB_PATH;
 extern bool FUZZY_SEARCHING;
 extern bool AUTO_RENAME_DOWNLOADED_PAPERS;
 extern bool SHOW_STATUSBAR_ONLY_WHEN_MOUSE_OVER;
+extern bool SHOW_TAB_BAR;
+extern bool TAB_BAR_AT_TOP;
 
 extern float TEXT_SELECTION_MINIMUM_DISTANCE;
 extern float VISUAL_MARK_NEXT_PAGE_FRACTION;
@@ -489,9 +493,39 @@ void MainWidget::resizeEvent(QResizeEvent* resize_event) {
     }
 
     int status_bar_height = get_status_bar_height();
+    int tab_bar_h = get_tab_bar_height();
+
+    // Position tab bar
+    if (tab_bar_widget != nullptr) {
+        bool show_tabs = should_show_tab_bar() && document_manager->get_tabs().size() > 1;
+        if (show_tabs) {
+            if (TAB_BAR_AT_TOP) {
+                tab_bar_widget->move(0, 0);
+            } else {
+                tab_bar_widget->move(0, main_window_height - status_bar_height - tab_bar_h);
+            }
+            tab_bar_widget->resize(main_window_width, tab_bar_h);
+            tab_bar_widget->show();
+            tab_bar_widget->update_tabs();
+        } else {
+            tab_bar_widget->hide();
+            tab_bar_h = 0;
+        }
+    } else {
+        tab_bar_h = 0;
+    }
+
+    // Adjust layout margins so OpenGL widget doesn't underlap tab bar or status bar
+    QVBoxLayout* vlayout = qobject_cast<QVBoxLayout*>(central_widget->layout());
+    if (vlayout) {
+        int top_margin = TAB_BAR_AT_TOP ? tab_bar_h : 0;
+        int bot_margin = (!TAB_BAR_AT_TOP ? tab_bar_h : 0) + status_bar_height;
+        vlayout->setContentsMargins(0, top_margin, 0, bot_margin);
+    }
 
     if (text_command_line_edit_container != nullptr) {
-        text_command_line_edit_container->move(0, 0);
+        int cmd_y = (TAB_BAR_AT_TOP && tab_bar_h > 0) ? tab_bar_h : 0;
+        text_command_line_edit_container->move(0, cmd_y);
         text_command_line_edit_container->resize(main_window_width, status_bar_height);
     }
 
@@ -937,7 +971,60 @@ MainWidget::MainWidget(fz_context* mupdf_context,
 
     status_label->setLayout(status_label_layout);
 
-    opengl_widget->stackUnder(status_label);
+    // Create tab bar widget
+    tab_bar_widget = new TabBarWidget(this);
+    tab_bar_widget->setFont(QFont(get_status_font_face_name()));
+    tab_bar_widget->hide(); // hidden until we have >1 tab
+
+    document_manager->add_tab_change_listener([this]() {
+        QMetaObject::invokeMethod(this, [this]() { update_tab_bar(); }, Qt::QueuedConnection);
+    });
+
+    opengl_widget->stackUnder(tab_bar_widget);
+    tab_bar_widget->stackUnder(status_label);
+
+    // Color wheel for highlight type selection on right-click hold
+    color_wheel_widget = new ColorWheelWidget(central_widget);
+    color_wheel_widget->hide();
+    connect(color_wheel_widget, &ColorWheelWidget::type_selected,
+        this, [this](int hl_index, char new_type) {
+            if (hl_index >= 0) {
+                // Changing an existing highlight's type
+                set_selected_highlight_index(hl_index);
+                change_selected_highlight_type(new_type);
+            } else {
+                // Creating a new highlight from selected text
+                handle_add_highlight(new_type);
+            }
+            update_recently_used_highlight_type(new_type);
+            invalidate_render();
+        });
+    connect(color_wheel_widget, &ColorWheelWidget::delete_selected,
+        this, [this](int hl_index) {
+            if (hl_index >= 0 && main_document_view) {
+                if (selected_highlight_index == hl_index) {
+                    selected_highlight_index = -1;
+                }
+                main_document_view->delete_highlight_with_index(hl_index);
+                invalidate_render();
+            }
+        });
+    connect(color_wheel_widget, &ColorWheelWidget::wheel_dismissed,
+        this, [this]() {
+            color_wheel_active = false;
+            right_click_highlight_index = -1;
+        });
+
+    right_click_hold_timer = new QTimer(this);
+    right_click_hold_timer->setSingleShot(true);
+    right_click_hold_timer->setInterval(250);
+    connect(right_click_hold_timer, &QTimer::timeout, this, [this]() {
+        // Timer is only started when there's a valid target (selection or highlight),
+        // so no additional guard needed here
+        color_wheel_active = true;
+        color_wheel_widget->show_at(right_click_press_pos,
+            right_click_highlight_index, recently_used_highlight_types);
+    });
 
     // automatically open the helper window in second monitor
     int num_screens = QGuiApplication::screens().size();
@@ -3035,7 +3122,20 @@ void MainWidget::mouseReleaseEvent(QMouseEvent* mevent) {
     }
 
     if (mevent->button() == Qt::MouseButton::RightButton) {
-        if (is_shift_pressed) {
+        // Color wheel is active — it handles release via grabMouse
+        if (color_wheel_active) {
+            color_wheel_active = false;
+            right_click_highlight_index = -1;
+        }
+        // Released before hold threshold — fire deferred normal right-click
+        else if (right_click_hold_timer->isActive()) {
+            right_click_hold_timer->stop();
+            WindowPos wpos{ mevent->pos().x(), mevent->pos().y() };
+            handle_right_click(wpos, true, is_shift_pressed, is_control_pressed, is_command_pressed, is_alt_pressed);
+            handle_right_click(wpos, false, is_shift_pressed, is_control_pressed, is_command_pressed, is_alt_pressed);
+            right_click_highlight_index = -1;
+        }
+        else if (is_shift_pressed) {
             execute_macro_if_enabled(SHIFT_RIGHT_CLICK_COMMAND);
         }
         else if (is_control_pressed) {
@@ -3178,7 +3278,25 @@ void MainWidget::mousePressEvent(QMouseEvent* mevent) {
     }
 
     if (mevent->button() == Qt::MouseButton::RightButton) {
-        handle_right_click({ mevent->pos().x(), mevent->pos().y() }, true, is_shift_pressed, is_control_pressed, is_command_pressed, is_alt_pressed);
+        bool has_selection = main_document_view && main_document_view->selected_character_rects.size() > 0;
+        bool has_highlight_under = false;
+        int hl_index = -1;
+
+        if (!has_selection && main_document_view && main_document_view->get_document()) {
+            WindowPos wpos{ mevent->pos().x(), mevent->pos().y() };
+            hl_index = main_document_view->get_highlight_index_in_pos(wpos);
+            has_highlight_under = (hl_index >= 0);
+        }
+
+        if (has_selection || has_highlight_under) {
+            // Start hold timer for color wheel (defer normal right-click)
+            right_click_highlight_index = hl_index; // -1 for selection mode, >= 0 for existing highlight
+            right_click_press_pos = mevent->pos();
+            right_click_hold_timer->start();
+        } else {
+            right_click_highlight_index = -1;
+            handle_right_click({ mevent->pos().x(), mevent->pos().y() }, true, is_shift_pressed, is_control_pressed, is_command_pressed, is_alt_pressed);
+        }
     }
 
     if (mevent->button() == Qt::MouseButton::MiddleButton) {
@@ -4956,6 +5074,44 @@ void MainWidget::toggle_statusbar() {
     }
 }
 
+void MainWidget::toggle_tab_bar() {
+    should_show_tab_bar_ = !should_show_tab_bar_;
+    // Trigger re-layout by faking a resize
+    QResizeEvent event(size(), size());
+    resizeEvent(&event);
+}
+
+bool MainWidget::should_show_tab_bar() {
+    return should_show_tab_bar_ && SHOW_TAB_BAR;
+}
+
+void MainWidget::update_tab_bar() {
+    if (tab_bar_widget) {
+        // Re-layout in case tab count changed (show/hide logic)
+        QResizeEvent event(size(), size());
+        resizeEvent(&event);
+    }
+}
+
+int MainWidget::get_tab_bar_height() {
+    return get_status_bar_height();
+}
+
+void MainWidget::handle_close_tab(const std::wstring& path) {
+    auto tabs = document_manager->get_tabs();
+    if (tabs.size() <= 1) return; // don't close the last tab
+
+    bool is_active = (doc() && doc()->get_path() == path);
+    if (is_active) {
+        // Switch to an adjacent tab before closing
+        int idx = get_current_tab_index();
+        int next = (idx + 1) % (int)tabs.size();
+        if (next == idx && tabs.size() > 1) next = 0;
+        handle_goto_tab(tabs[next]);
+    }
+    document_manager->remove_tab(path);
+}
+
 void MainWidget::toggle_titlebar() {
 
     Qt::WindowFlags flags = windowFlags();
@@ -5961,6 +6117,7 @@ std::wstring MainWidget::handle_add_highlight(char symbol) {
         std::string uuid = main_document_view->add_highlight(selection_begin, selection_end, symbol);
         clear_selected_text();
         selected_highlight_index = doc()->get_highlight_index_with_uuid(uuid);
+        update_recently_used_highlight_type(symbol);
         return utf8_decode(uuid);
     }
     else {
@@ -5972,6 +6129,18 @@ std::wstring MainWidget::handle_add_highlight(char symbol) {
 void MainWidget::change_selected_highlight_type(char new_type) {
     if (selected_highlight_index != -1) {
         doc()->update_highlight_type(selected_highlight_index, new_type);
+        update_recently_used_highlight_type(new_type);
+    }
+}
+
+void MainWidget::update_recently_used_highlight_type(char type) {
+    if (type < 'a' || type > 'z') return;
+    recently_used_highlight_types.erase(
+        std::remove(recently_used_highlight_types.begin(), recently_used_highlight_types.end(), type),
+        recently_used_highlight_types.end());
+    recently_used_highlight_types.push_front(type);
+    if (recently_used_highlight_types.size() > 26) {
+        recently_used_highlight_types.pop_back();
     }
 }
 
@@ -6583,15 +6752,21 @@ bool MainWidget::event(QEvent* event) {
 
     QTabletEvent* te = dynamic_cast<QTabletEvent*>(event);
     QKeyEvent* ke = dynamic_cast<QKeyEvent*>(event);
-    if (ke && (ke->type() == QEvent::KeyPress)) {
-        // Apparently Qt doesn't send keyPressEvent for tab and backtab anymore, so we have to
-        // manually handle them here.
-        // todo: make sure this doesn't cause problems on linux and mac
-        //if (((ke->key() == Qt::Key_Tab) && (ke->modifiers() == 0)) || ((ke->key() == Qt::Key_Backtab) && (ke->modifiers() == Qt::ShiftModifier))) {
-        //    if (event->isAccepted()) {
-        //        key_event(false, ke);
-        //    }
-        //}
+    // Qt eats Tab/Backtab KeyPress events for focus-chain navigation before
+    // keyPressEvent() is called. Intercept the ShortcutOverride and dispatch
+    // tab cycling directly — the keybinding matcher's key normalization has
+    // issues with Backtab events from ShortcutOverride.
+    if (ke && ke->type() == QEvent::ShortcutOverride) {
+        if ((ke->key() == Qt::Key_Tab || ke->key() == Qt::Key_Backtab) &&
+            ((ke->modifiers() & Qt::ControlModifier) || (ke->modifiers() & Qt::MetaModifier))) {
+            if (ke->key() == Qt::Key_Backtab) {
+                goto_ith_next_tab(-1);
+            } else {
+                goto_ith_next_tab(1);
+            }
+            event->accept();
+            return true;
+        }
     }
 
     if (event->type() == QEvent::WindowActivate) {
@@ -10085,6 +10260,7 @@ void MainWidget::handle_goto_tab(const std::wstring& path) {
 
     push_state();
     open_document(path);
+    document_manager->notify_tab_changed();
 }
 
 void MainWidget::handle_rename(std::wstring new_name) {

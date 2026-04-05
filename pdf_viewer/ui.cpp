@@ -1596,6 +1596,33 @@ bool BaseSelectorWidget::eventFilter(QObject* obj, QEvent* event) {
             }
         }
 #endif
+        // On macOS, Ctrl+N/P in QLineEdit are converted by Cocoa's text
+        // input system to moveDown:/moveUp: which arrive as Key_Down/Key_Up
+        // KeyPress events (handled at line ~1644). We accept the
+        // ShortcutOverride so Qt doesn't consume it as a shortcut, but
+        // do NOT dispatch the command here — Cocoa's synthetic Key_Down/Up
+        // already does the work. Dispatching here too would double-move.
+        if (event->type() == QEvent::ShortcutOverride) {
+            QKeyEvent* key_event = static_cast<QKeyEvent*>(event);
+            bool is_ctrl = is_platform_control_pressed(key_event);
+            bool is_alt = key_event->modifiers() & Qt::AltModifier;
+            if (is_ctrl || is_alt) {
+                MyLineEdit* mle = dynamic_cast<MyLineEdit*>(line_edit);
+                if (mle && mle->main_widget) {
+                    bool is_shift = key_event->modifiers() & Qt::ShiftModifier;
+                    bool is_meta = is_platform_meta_pressed(key_event);
+                    std::unique_ptr<Command> command = mle->main_widget->input_handler->get_menu_command(
+                        mle->main_widget, key_event, is_shift, is_ctrl, is_meta, is_alt);
+                    if (command && command->is_menu_command()) {
+                        // Accept so Qt doesn't eat it; Cocoa will generate
+                        // the equivalent Key_Down/Up which the KeyPress
+                        // handler below forwards to the list view.
+                        event->accept();
+                        return true;
+                    }
+                }
+            }
+        }
         if (event->type() == QEvent::InputMethod) {
             if (TOUCH_MODE) {
                 QInputMethodEvent* input_event = static_cast<QInputMethodEvent*>(event);
@@ -1632,7 +1659,7 @@ bool BaseSelectorWidget::eventFilter(QObject* obj, QEvent* event) {
                 //QCoreApplication::postEvent(tree_view, key_event);
                 return true;
             }
-            if (key_event->key() == Qt::Key_Tab) {
+            if (key_event->key() == Qt::Key_Tab && !is_control_pressed && !is_alt_pressed) {
                 QKeyEvent* new_key_event = new QKeyEvent(key_event->type(), Qt::Key_Down, key_event->modifiers());
                 QCoreApplication::postEvent(get_view(), new_key_event);
                 return true;
@@ -1647,7 +1674,7 @@ bool BaseSelectorWidget::eventFilter(QObject* obj, QEvent* event) {
                 QCoreApplication::postEvent(get_view(), new_key_event);
                 return true;
             }
-            if (key_event->key() == Qt::Key_Backtab) {
+            if (key_event->key() == Qt::Key_Backtab && !is_control_pressed && !is_alt_pressed) {
                 QKeyEvent* new_key_event = new QKeyEvent(key_event->type(), Qt::Key_Up, key_event->modifiers());
                 QCoreApplication::postEvent(get_view(), new_key_event);
                 return true;
@@ -1895,8 +1922,7 @@ void MyLineEdit::keyPressEvent(QKeyEvent* event) {
         std::unique_ptr<Command> command = main_widget->input_handler->get_menu_command(main_widget, event, is_shift_pressed, is_control_pressed, is_meta_pressed, is_alt_pressed);
 
         if (command && command->is_menu_command()) {
-            // this command will be handled later by our command manager so we ignore it here.
-            event->ignore();
+            main_widget->handle_command_types(std::move(command), 0);
             return;
         }
     }
